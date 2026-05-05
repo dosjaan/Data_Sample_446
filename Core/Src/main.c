@@ -26,12 +26,14 @@
 #include "string.h"
 #include"stdarg.h"
 #include "motor.h"
+#include "amt203.h"
 typedef struct {
 	uint32_t time_stamp;   // ms
 	int32_t ENC1_pos;     // Encoder 1 position
 	int32_t ENC2_pos;     // Encoder 2 position
 	int8_t  ENC1_dir;     // +1 / -1 (last direction)
 	int8_t  ENC2_dir;     // +1 / -1
+	int16_t Angle;
 } Buffer_struct;
 typedef struct __attribute__((packed)) {
 	uint32_t time_stamp;
@@ -39,6 +41,7 @@ typedef struct __attribute__((packed)) {
 	int32_t  ENC2_pos;
 	int8_t   ENC1_dir;
 	int8_t   ENC2_dir;
+	int16_t Angle;
 } LogEntry;
 #define LOG_BUFFER_SIZE 512  // Буферийг томсгов
 #define WRITE_CACHE_SIZE 512  // SD картны сектортой ижил
@@ -58,6 +61,7 @@ int16_t ir_count;
 int16_t irA_count;
 int16_t irB_count;
 uint16_t pos=0;
+volatile int16_t latestAngle;
 volatile FRESULT sd_res = FR_OK;
 volatile UINT sd_bw = 0;
 volatile uint16_t sd_size = 0;
@@ -66,6 +70,12 @@ volatile uint32_t sd_write_count = 0;
 volatile uint32_t pop_count = 0;
 #define AMT203_CS_LOW()   HAL_GPIO_WritePin(SPI1_CS_GPIO_Port,SPI1_CS_Pin, GPIO_PIN_RESET)
 #define AMT203_CS_HIGH()  HAL_GPIO_WritePin(SPI1_CS_GPIO_Port,SPI1_CS_Pin, GPIO_PIN_SET)
+AMT203_t  encoder;
+uint16_t  encoderRawPosition;    /* 0–4095, 0xFFFF = read failure     */
+float     encoderDegrees;        /* 0.0–360.0                          */
+uint8_t   encoderSetZeroResult;  /* 1 = success (power-cycle required) */
+uint8_t   spiLastResponse;       /* last raw byte from encoder — debug */
+uint8_t Angle_read_flag=0;
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,7 +94,6 @@ volatile uint32_t pop_count = 0;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi3;
 
@@ -168,7 +177,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     LogEntry entry = {0};
     int8_t dir = 0;
     uint32_t ts = TIM5->CNT;
-
     if (htim->Instance == TIM1 &&
         htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
     {
@@ -182,7 +190,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         entry.ENC2_pos   = Log.ENC2_pos;
         entry.ENC1_dir   = dir;
         entry.ENC2_dir   = 0;
-
+        entry.Angle=latestAngle;
         log_push(&entry);
         irA_count++;
     }
@@ -199,7 +207,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         entry.ENC2_pos   = Log.ENC2_pos;
         entry.ENC1_dir   = 0;
         entry.ENC2_dir   = dir;
-
+        entry.Angle=latestAngle;;
         log_push(&entry);
         irB_count++;
     }
@@ -231,45 +239,7 @@ static int log_pop(LogEntry *entry)
 	return 1;
 }
 
-uint16_t AMT203_ReadPosition(SPI_HandleTypeDef *hspi)
-{
-    uint8_t tx, rx;
-    uint8_t high, low;
-    uint16_t timeout;
 
-    // 1. rd_pos команд илгээ
-    AMT203_CS_LOW();
-    tx = 0x10;
-    HAL_SPI_TransmitReceive(hspi, &tx, &rx, 1, 10);
-    AMT203_CS_HIGH();  // ← заавал CS HIGH
-
-    // 2. 0x10 хариу ирэх хүртэл хүлээ
-    timeout = 100;
-    do {
-        HAL_Delay(1);
-        AMT203_CS_LOW();
-        tx = 0x00;
-        HAL_SPI_TransmitReceive(hspi, &tx, &rx, 1, 10);
-        AMT203_CS_HIGH();
-        timeout--;
-    } while (rx != 0x10 && timeout > 0);
-
-    if (timeout == 0) return 0xFFFF;
-
-    // 3. MSB уншина
-    AMT203_CS_LOW();
-    tx = 0x00;
-    HAL_SPI_TransmitReceive(hspi, &tx, &high, 1, 10);
-    AMT203_CS_HIGH();
-
-    // 4. LSB уншина
-    AMT203_CS_LOW();
-    tx = 0x00;
-    HAL_SPI_TransmitReceive(hspi, &tx, &low, 1, 10);
-    AMT203_CS_HIGH();
-
-    return ((high & 0x0F) << 8) | low;
-}
 
 void Estimate_Speed1(Motor_Encoder_Variables *Encoder)
 {
@@ -297,7 +267,6 @@ static void MX_TIM5_Init(void);
 static void MX_TIM12_Init(void);
 static void MX_SPI3_Init(void);
 static void MX_TIM4_Init(void);
-static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -343,8 +312,11 @@ int main(void)
   MX_TIM12_Init();
   MX_SPI3_Init();
   MX_TIM4_Init();
-  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+
+  AMT203_Init(&encoder, &hspi3, GPIOC, GPIO_PIN_3);
+  HAL_Delay(2);
+  AMT203_SetZero(&encoder);  /* USER CODE END 2 */
 	FATFS FatFs; 	//Fatfs handle
 	FIL fil; 		//File handle
 	FRESULT fres; //Result after operations
@@ -353,7 +325,7 @@ int main(void)
 	fres = f_mount(&FatFs, "", 1);
 	if(fres != FR_OK) while(1);
 
-	fres = f_open(&fil, "log13.bin", FA_OPEN_ALWAYS | FA_WRITE);
+	fres = f_open(&fil, "log16.bin", FA_OPEN_ALWAYS | FA_WRITE);
 	if (fres != FR_OK) Error_Handler();
 
 	f_lseek(&fil, f_size(&fil));
@@ -431,6 +403,14 @@ int main(void)
 		}
 		/* 2 секунд тутам үлдсэн data-г SD руу flush хийнэ */
 		static uint32_t last_sync = 0;
+
+    	    encoderRawPosition = AMT203_GetPosition(&encoder);
+
+    	    if (encoderRawPosition != AMT203_RD_FAILED)
+    	    {
+    	        encoderDegrees = ((float)encoderRawPosition / 4096.0f) * 360.0f*10;
+    	        latestAngle = (int16_t)(encoderDegrees);
+    	    }
 
 		if (HAL_GetTick() - last_sync >= 1000)
 		{
@@ -532,44 +512,6 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
 }
 
 /**

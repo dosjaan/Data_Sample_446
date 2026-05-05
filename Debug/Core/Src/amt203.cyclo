@@ -1,0 +1,4 @@
+../Core/Src/amt203.c:3:6:AMT203_Init	1
+../Core/Src/amt203.c:20:9:AMT203_GetByte	1
+../Core/Src/amt203.c:40:10:AMT203_GetPosition	6
+../Core/Src/amt203.c:110:6:AMT203_SetZero	3
